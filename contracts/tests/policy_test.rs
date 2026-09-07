@@ -1,14 +1,15 @@
 #![cfg(test)]
 
+use soroban_sdk::testutils::Ledger as _;
 use soroban_sdk::{token, Env, String};
 
-use proxima_contracts::policy::{PolicyContract, PolicyContractClient};
+use proxima_contracts::policy::{PolicyContract, PolicyContractClient, PolicyError};
 
 fn create_test_env() -> Env {
     Env::default()
 }
 
-/// Helper: deploy the policy contract and return its client + a mock USDC issuer
+/// Helper: deploy the policy contract and return its client + a mock USDC issuer.
 fn setup(env: &Env) -> (PolicyContractClient<'_>, soroban_sdk::Address) {
     let contract_id = env.register_contract(None, PolicyContract);
     let client = PolicyContractClient::new(env, &contract_id);
@@ -16,7 +17,7 @@ fn setup(env: &Env) -> (PolicyContractClient<'_>, soroban_sdk::Address) {
     (client, issuer)
 }
 
-/// Helper: mint `amount` of `asset` to `to` using the Stellar token contract.
+/// Helper: mint `amount` of token to `to` using the Stellar token contract.
 fn mint_token(
     env: &Env,
     issuer: &soroban_sdk::Address,
@@ -29,8 +30,50 @@ fn mint_token(
     token_contract_id.address()
 }
 
-// ─── create_policy ───────────────────────────────────────────────────────────
+/// Helper: set up a policy contract + a funded token account ready to
+/// call execute_payment. Returns (client, policy_id, agent, recipient, token_id).
+fn setup_payment_env(
+    env: &Env,
+) -> (
+    PolicyContractClient<'_>,
+    u64,
+    soroban_sdk::Address,
+    soroban_sdk::Address,
+    soroban_sdk::Address,
+) {
+    let contract_id = env.register_contract(None, PolicyContract);
+    let client = PolicyContractClient::new(env, &contract_id);
 
+    let issuer = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(env);
+    let agent = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(env);
+    let recipient = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(env);
+
+    // Mint 100 USDC (1_000_000_000 stroops) to the policy contract to fund transfers.
+    let token_id = mint_token(env, &issuer, &contract_id, 1_000_000_000);
+
+    // Extend instance TTLs so advancing ledger sequence does not archive contracts in tests
+    env.as_contract(&contract_id, || {
+        env.storage().instance().extend_ttl(50_000, 50_000);
+    });
+    env.as_contract(&token_id, || {
+        env.storage().instance().extend_ttl(50_000, 50_000);
+    });
+
+    let policy_id = client.create_policy(
+        &agent,
+        &500_000_i128,    // 0.05 USDC max per tx
+        &10_000_000_i128, // 1.00 USDC daily limit
+        &String::from_str(env, "USDC"),
+        &token_id, // token address as issuer
+        &None,
+    );
+
+    (client, policy_id, agent, recipient, token_id)
+}
+
+// ─── Happy Path Tests ────────────────────────────────────────────────────────
+
+/// 1. test_create_policy_success — create a policy, verify all fields are stored correctly.
 #[test]
 fn test_create_policy_success() {
     let env = create_test_env();
@@ -49,127 +92,57 @@ fn test_create_policy_success() {
     assert_eq!(policy_id, 1);
 
     let policy = client.get_policy(&policy_id);
+    assert_eq!(policy.id, policy_id);
     assert_eq!(policy.agent, agent);
     assert_eq!(policy.max_per_tx, 500_000);
     assert_eq!(policy.daily_limit, 10_000_000);
+    assert_eq!(policy.asset, String::from_str(&env, "USDC"));
+    assert_eq!(policy.issuer, issuer);
     assert_eq!(policy.spent_today, 0);
     assert_eq!(policy.total_spent, 0);
     assert!(policy.is_active);
-    assert!(policy.allowed_recipient.is_none());
+    assert_eq!(policy.allowed_recipient, None);
+    assert_eq!(policy.last_reset_ledger, env.ledger().sequence());
+    assert_eq!(policy.created_at, env.ledger().sequence());
 }
 
+/// 2. test_execute_payment_success — agent executes a payment within limits, verify token transfer happens.
 #[test]
-fn test_create_policy_with_allowed_recipient() {
+fn test_execute_payment_success() {
     let env = create_test_env();
-    let (client, issuer) = setup(&env);
-    let agent = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
-    let recipient = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+    env.mock_all_auths();
 
-    let policy_id = client.create_policy(
-        &agent,
-        &100_000_i128,
-        &1_000_000_i128,
-        &String::from_str(&env, "USDC"),
-        &issuer,
-        &Some(recipient.clone()),
+    let (client, policy_id, agent, recipient, token_id) = setup_payment_env(&env);
+    let payment_amount = 100_000_i128; // 0.01 USDC
+
+    let record = client.execute_payment(
+        &policy_id,
+        &recipient,
+        &payment_amount,
+        &String::from_str(&env, "API call #1"),
     );
 
+    // Verify PaymentRecord values
+    assert_eq!(record.policy_id, policy_id);
+    assert_eq!(record.agent, agent);
+    assert_eq!(record.recipient, recipient);
+    assert_eq!(record.amount, payment_amount);
+    assert_eq!(record.asset, String::from_str(&env, "USDC"));
+    assert_eq!(record.memo, String::from_str(&env, "API call #1"));
+
+    // Verify policy state updated
     let policy = client.get_policy(&policy_id);
-    assert_eq!(policy.allowed_recipient, Some(recipient));
+    assert_eq!(policy.spent_today, payment_amount);
+    assert_eq!(policy.total_spent, payment_amount);
+
+    // Verify token transfer happened: recipient balance increased
+    let token = token::Client::new(&env, &token_id);
+    assert_eq!(token.balance(&recipient), payment_amount);
 }
 
+/// 3. test_revoke_policy_success — owner revokes policy, verify is_active becomes false.
 #[test]
-fn test_create_policy_invalid_amount_panics() {
-    let env = create_test_env();
-    let (client, issuer) = setup(&env);
-    let agent = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
-
-    // max_per_tx = 0 should fail
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.create_policy(
-            &agent,
-            &0_i128,
-            &1_000_000_i128,
-            &String::from_str(&env, "USDC"),
-            &issuer,
-            &None,
-        );
-    }));
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_policy_counter_increments() {
-    let env = create_test_env();
-    let (client, issuer) = setup(&env);
-
-    for _ in 0..5 {
-        let agent = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
-        client.create_policy(
-            &agent,
-            &100_000_i128,
-            &1_000_000_i128,
-            &String::from_str(&env, "USDC"),
-            &issuer,
-            &None,
-        );
-    }
-
-    assert_eq!(client.policy_count(), 5);
-}
-
-// ─── is_authorized ────────────────────────────────────────────────────────────
-
-#[test]
-fn test_is_authorized_returns_true_for_active_policy() {
-    let env = create_test_env();
-    let (client, issuer) = setup(&env);
-    let agent = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
-
-    let policy_id = client.create_policy(
-        &agent,
-        &100_000_i128,
-        &1_000_000_i128,
-        &String::from_str(&env, "USDC"),
-        &issuer,
-        &None,
-    );
-
-    assert!(client.is_authorized(&policy_id, &agent));
-}
-
-#[test]
-fn test_is_authorized_returns_false_for_wrong_agent() {
-    let env = create_test_env();
-    let (client, issuer) = setup(&env);
-    let agent = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
-    let other = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
-
-    let policy_id = client.create_policy(
-        &agent,
-        &100_000_i128,
-        &1_000_000_i128,
-        &String::from_str(&env, "USDC"),
-        &issuer,
-        &None,
-    );
-
-    assert!(!client.is_authorized(&policy_id, &other));
-}
-
-#[test]
-fn test_is_authorized_returns_false_for_nonexistent_policy() {
-    let env = create_test_env();
-    let (client, _) = setup(&env);
-    let agent = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
-
-    assert!(!client.is_authorized(&999, &agent));
-}
-
-// ─── revoke_policy ────────────────────────────────────────────────────────────
-
-#[test]
-fn test_revoke_policy_sets_inactive() {
+fn test_revoke_policy_success() {
     let env = create_test_env();
     env.mock_all_auths();
     let (client, issuer) = setup(&env);
@@ -188,230 +161,193 @@ fn test_revoke_policy_sets_inactive() {
 
     client.revoke_policy(&policy_id);
 
-    assert!(!client.get_policy(&policy_id).is_active);
-    assert!(!client.is_authorized(&policy_id, &agent));
-}
-
-#[test]
-fn test_revoke_nonexistent_policy_panics() {
-    let env = create_test_env();
-    let (client, _) = setup(&env);
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.revoke_policy(&9999);
-    }));
-    assert!(result.is_err());
-}
-
-// ─── remaining_allowance ─────────────────────────────────────────────────────
-
-#[test]
-fn test_remaining_allowance_starts_at_daily_limit() {
-    let env = create_test_env();
-    let (client, issuer) = setup(&env);
-    let agent = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
-
-    let policy_id = client.create_policy(
-        &agent,
-        &100_000_i128,
-        &5_000_000_i128, // 0.50 USDC daily
-        &String::from_str(&env, "USDC"),
-        &issuer,
-        &None,
-    );
-
-    // Nothing spent yet — full daily limit should be remaining
-    let remaining = client.remaining_allowance(&policy_id);
-    assert_eq!(remaining, 5_000_000);
-}
-
-// ─── get_policy ───────────────────────────────────────────────────────────────
-
-#[test]
-fn test_get_nonexistent_policy_panics() {
-    let env = create_test_env();
-    let (client, _) = setup(&env);
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.get_policy(&9999);
-    }));
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_policy_stores_correct_asset_and_issuer() {
-    let env = create_test_env();
-    let (client, issuer) = setup(&env);
-    let agent = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
-
-    let policy_id = client.create_policy(
-        &agent,
-        &100_000_i128,
-        &1_000_000_i128,
-        &String::from_str(&env, "USDC"),
-        &issuer,
-        &None,
-    );
-
     let policy = client.get_policy(&policy_id);
-    assert_eq!(policy.asset, String::from_str(&env, "USDC"));
-    assert_eq!(policy.issuer, issuer);
+    assert!(!policy.is_active);
 }
 
+/// 4. test_remaining_allowance_full — new policy has full daily limit available.
 #[test]
-fn test_multiple_policies_independent() {
+fn test_remaining_allowance_full() {
     let env = create_test_env();
-    env.mock_all_auths();
     let (client, issuer) = setup(&env);
+    let agent = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
 
-    let agent_a = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
-    let agent_b = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
-
-    let id_a = client.create_policy(
-        &agent_a,
-        &100_000_i128,
-        &1_000_000_i128,
-        &String::from_str(&env, "USDC"),
-        &issuer,
-        &None,
-    );
-
-    let id_b = client.create_policy(
-        &agent_b,
-        &200_000_i128,
-        &2_000_000_i128,
-        &String::from_str(&env, "USDC"),
-        &issuer,
-        &None,
-    );
-
-    assert_ne!(id_a, id_b);
-
-    let policy_a = client.get_policy(&id_a);
-    let policy_b = client.get_policy(&id_b);
-
-    assert_eq!(policy_a.agent, agent_a);
-    assert_eq!(policy_b.agent, agent_b);
-    assert_eq!(policy_a.max_per_tx, 100_000);
-    assert_eq!(policy_b.max_per_tx, 200_000);
-
-    // Revoking A should not affect B
-    client.revoke_policy(&id_a);
-    assert!(!client.get_policy(&id_a).is_active);
-    assert!(client.get_policy(&id_b).is_active);
-}
-
-// ─── execute_payment ─────────────────────────────────────────────────────────
-
-/// Helper: set up a policy contract + a funded token account ready to
-/// call execute_payment.  Returns (client, policy_id, agent, recipient).
-fn setup_payment_env(
-    env: &Env,
-) -> (
-    PolicyContractClient<'_>,
-    u64,
-    soroban_sdk::Address,
-    soroban_sdk::Address,
-    soroban_sdk::Address, // token_id
-) {
-    let contract_id = env.register_contract(None, PolicyContract);
-    let client = PolicyContractClient::new(env, &contract_id);
-
-    let issuer = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(env);
-    let agent = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(env);
-    let recipient = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(env);
-
-    // Create a Stellar asset and mint 10 USDC (100_000_000 stroops) to the
-    // policy contract so it can fund transfers.
-    let token_id = mint_token(env, &issuer, &contract_id, 100_000_000);
-
+    let daily_limit = 5_000_000_i128;
     let policy_id = client.create_policy(
         &agent,
-        &500_000_i128,    // 0.05 USDC max per tx
-        &10_000_000_i128, // 1.00 USDC daily limit
-        &String::from_str(env, "USDC"),
-        &token_id, // use the registered token address as issuer
+        &100_000_i128,
+        &daily_limit,
+        &String::from_str(&env, "USDC"),
+        &issuer,
         &None,
     );
 
-    (client, policy_id, agent, recipient, token_id)
+    assert_eq!(client.remaining_allowance(&policy_id), daily_limit);
 }
 
+/// 5. test_remaining_allowance_after_spend — after a payment, remaining allowance decreases correctly.
 #[test]
-fn test_execute_payment_success() {
+fn test_remaining_allowance_after_spend() {
     let env = create_test_env();
     env.mock_all_auths();
 
-    let (client, policy_id, agent, recipient, token_id) = setup_payment_env(&env);
+    let (client, policy_id, _agent, recipient, _token_id) = setup_payment_env(&env);
 
-    let payment_amount = 100_000_i128; // 0.01 USDC
+    let initial = client.remaining_allowance(&policy_id);
+    assert_eq!(initial, 10_000_000);
 
-    let record = client.execute_payment(
+    let spend_amount = 500_000_i128;
+    client.execute_payment(
         &policy_id,
         &recipient,
-        &payment_amount,
-        &String::from_str(&env, "API call #1"),
+        &spend_amount,
+        &String::from_str(&env, "payment #1"),
     );
 
-    // Return value correct
-    assert_eq!(record.policy_id, policy_id);
-    assert_eq!(record.agent, agent);
-    assert_eq!(record.recipient, recipient);
-    assert_eq!(record.amount, payment_amount);
-
-    // Policy state updated
-    let policy = client.get_policy(&policy_id);
-    assert_eq!(policy.spent_today, payment_amount);
-    assert_eq!(policy.total_spent, payment_amount);
-
-    // Recipient balance increased
-    let token = token::Client::new(&env, &token_id);
-    assert_eq!(token.balance(&recipient), payment_amount);
+    assert_eq!(
+        client.remaining_allowance(&policy_id),
+        initial - spend_amount
+    );
 }
 
+/// 6. test_daily_reset — advance ledger by 17,280+ sequences, verify spent_today resets to 0.
 #[test]
-fn test_execute_payment_accumulates_spent_today() {
+fn test_daily_reset() {
     let env = create_test_env();
     env.mock_all_auths();
 
     let (client, policy_id, _agent, recipient, _token_id) = setup_payment_env(&env);
 
-    // Make three payments
-    for _ in 0..3 {
-        client.execute_payment(
-            &policy_id,
-            &recipient,
+    // Spend 400_000 stroops on day 1
+    let spend_day_1 = 400_000_i128;
+    client.execute_payment(
+        &policy_id,
+        &recipient,
+        &spend_day_1,
+        &String::from_str(&env, "day 1 payment"),
+    );
+
+    let policy_day_1 = client.get_policy(&policy_id);
+    assert_eq!(policy_day_1.spent_today, spend_day_1);
+    assert_eq!(client.remaining_allowance(&policy_id), 10_000_000 - spend_day_1);
+
+    // Advance ledger sequence by 17,281 (exceeds LEDGERS_PER_DAY = 17,280)
+    env.ledger().with_mut(|l| l.sequence_number += 17_281);
+
+    // remaining_allowance should now reflect full daily reset
+    assert_eq!(client.remaining_allowance(&policy_id), 10_000_000);
+
+    // Execute next payment on new day
+    let spend_day_2 = 250_000_i128;
+    client.execute_payment(
+        &policy_id,
+        &recipient,
+        &spend_day_2,
+        &String::from_str(&env, "day 2 payment"),
+    );
+
+    // spent_today should have reset to 0 before adding day 2 spend
+    let policy_day_2 = client.get_policy(&policy_id);
+    assert_eq!(policy_day_2.spent_today, spend_day_2);
+    // total_spent maintains cumulative spending across all days
+    assert_eq!(policy_day_2.total_spent, spend_day_1 + spend_day_2);
+    assert_eq!(client.remaining_allowance(&policy_id), 10_000_000 - spend_day_2);
+}
+
+/// 7. test_is_authorized_true — correct agent returns true.
+#[test]
+fn test_is_authorized_true() {
+    let env = create_test_env();
+    let (client, issuer) = setup(&env);
+    let agent = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+
+    let policy_id = client.create_policy(
+        &agent,
+        &100_000_i128,
+        &1_000_000_i128,
+        &String::from_str(&env, "USDC"),
+        &issuer,
+        &None,
+    );
+
+    assert!(client.is_authorized(&policy_id, &agent));
+}
+
+/// 8. test_is_authorized_false — wrong agent or inactive policy returns false.
+#[test]
+fn test_is_authorized_false() {
+    let env = create_test_env();
+    env.mock_all_auths();
+    let (client, issuer) = setup(&env);
+    let agent = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+    let wrong_agent = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+
+    let policy_id = client.create_policy(
+        &agent,
+        &100_000_i128,
+        &1_000_000_i128,
+        &String::from_str(&env, "USDC"),
+        &issuer,
+        &None,
+    );
+
+    // Unauthorized agent returns false
+    assert!(!client.is_authorized(&policy_id, &wrong_agent));
+
+    // Revoked (inactive) policy returns false even for the authorized agent
+    client.revoke_policy(&policy_id);
+    assert!(!client.is_authorized(&policy_id, &agent));
+
+    // Nonexistent policy returns false
+    assert!(!client.is_authorized(&9999, &agent));
+}
+
+/// 9. test_policy_count — increments correctly after each create_policy call.
+#[test]
+fn test_policy_count() {
+    let env = create_test_env();
+    let (client, issuer) = setup(&env);
+
+    assert_eq!(client.policy_count(), 0);
+
+    for i in 1..=3 {
+        let agent = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        client.create_policy(
+            &agent,
             &100_000_i128,
-            &String::from_str(&env, "test"),
+            &1_000_000_i128,
+            &String::from_str(&env, "USDC"),
+            &issuer,
+            &None,
         );
+        assert_eq!(client.policy_count(), i);
     }
-
-    let policy = client.get_policy(&policy_id);
-    assert_eq!(policy.spent_today, 300_000);
-    assert_eq!(policy.total_spent, 300_000);
 }
 
+// ─── Error / Negative Tests ──────────────────────────────────────────────────
+
+/// 10. test_payment_exceeds_per_tx_limit — amount > max_per_tx → ExceedsPerTxLimit.
 #[test]
-fn test_execute_payment_exceeds_per_tx_limit_panics() {
+fn test_payment_exceeds_per_tx_limit() {
     let env = create_test_env();
     env.mock_all_auths();
 
     let (client, policy_id, _agent, recipient, _token_id) = setup_payment_env(&env);
 
-    // max_per_tx is 500_000; try 600_000
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.execute_payment(
-            &policy_id,
-            &recipient,
-            &600_000_i128,
-            &String::from_str(&env, "too much"),
-        );
-    }));
-    assert!(result.is_err());
+    // max_per_tx is 500_000; attempt to spend 600_000
+    let res = client.try_execute_payment(
+        &policy_id,
+        &recipient,
+        &600_000_i128,
+        &String::from_str(&env, "too much"),
+    );
+
+    assert_eq!(res, Err(Ok(PolicyError::ExceedsPerTxLimit.into())));
 }
 
+/// 11. test_payment_exceeds_daily_limit — cumulative spend > daily_limit → ExceedsDailyLimit.
 #[test]
-fn test_execute_payment_exceeds_daily_limit_panics() {
+fn test_payment_exceeds_daily_limit() {
     let env = create_test_env();
     env.mock_all_auths();
 
@@ -427,20 +363,20 @@ fn test_execute_payment_exceeds_daily_limit_panics() {
         );
     }
 
-    // 21st payment should fail
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.execute_payment(
-            &policy_id,
-            &recipient,
-            &500_000_i128,
-            &String::from_str(&env, "over limit"),
-        );
-    }));
-    assert!(result.is_err());
+    // 21st payment would exceed daily limit
+    let res = client.try_execute_payment(
+        &policy_id,
+        &recipient,
+        &500_000_i128,
+        &String::from_str(&env, "over limit"),
+    );
+
+    assert_eq!(res, Err(Ok(PolicyError::ExceedsDailyLimit.into())));
 }
 
+/// 12. test_payment_on_revoked_policy — execute_payment on inactive policy → PolicyInactive.
 #[test]
-fn test_execute_payment_on_revoked_policy_panics() {
+fn test_payment_on_revoked_policy() {
     let env = create_test_env();
     env.mock_all_auths();
 
@@ -448,23 +384,34 @@ fn test_execute_payment_on_revoked_policy_panics() {
 
     client.revoke_policy(&policy_id);
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.execute_payment(
-            &policy_id,
-            &recipient,
-            &100_000_i128,
-            &String::from_str(&env, "revoked"),
-        );
-    }));
-    assert!(result.is_err());
+    let res = client.try_execute_payment(
+        &policy_id,
+        &recipient,
+        &100_000_i128,
+        &String::from_str(&env, "revoked payment"),
+    );
+
+    assert_eq!(res, Err(Ok(PolicyError::PolicyInactive.into())));
 }
 
+/// 13. test_revoke_nonexistent_policy → PolicyNotFound.
 #[test]
-fn test_execute_payment_wrong_recipient_panics() {
+fn test_revoke_nonexistent_policy() {
+    let env = create_test_env();
+    env.mock_all_auths();
+    let (client, _) = setup(&env);
+
+    let res = client.try_revoke_policy(&9999);
+
+    assert_eq!(res, Err(Ok(PolicyError::PolicyNotFound.into())));
+}
+
+/// 14. test_payment_wrong_recipient — policy has allowed_recipient set, different address passed → RecipientNotAllowed.
+#[test]
+fn test_payment_wrong_recipient() {
     let env = create_test_env();
     env.mock_all_auths();
 
-    // Create a policy with an allowed_recipient restriction
     let contract_id = env.register_contract(None, PolicyContract);
     let client = PolicyContractClient::new(&env, &contract_id);
     let issuer = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
@@ -483,52 +430,42 @@ fn test_execute_payment_wrong_recipient_panics() {
         &Some(allowed),
     );
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.execute_payment(
-            &policy_id,
-            &wrong,
-            &100_000_i128,
-            &String::from_str(&env, "wrong recipient"),
-        );
-    }));
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_execute_payment_zero_amount_panics() {
-    let env = create_test_env();
-    env.mock_all_auths();
-
-    let (client, policy_id, _agent, recipient, _token_id) = setup_payment_env(&env);
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.execute_payment(
-            &policy_id,
-            &recipient,
-            &0_i128,
-            &String::from_str(&env, "zero"),
-        );
-    }));
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_remaining_allowance_decreases_after_payment() {
-    let env = create_test_env();
-    env.mock_all_auths();
-
-    let (client, policy_id, _agent, recipient, _token_id) = setup_payment_env(&env);
-
-    let before = client.remaining_allowance(&policy_id);
-    assert_eq!(before, 10_000_000);
-
-    client.execute_payment(
+    let res = client.try_execute_payment(
         &policy_id,
-        &recipient,
-        &500_000_i128, // within max_per_tx limit
-        &String::from_str(&env, "pay"),
+        &wrong,
+        &100_000_i128,
+        &String::from_str(&env, "wrong recipient"),
     );
 
-    let after = client.remaining_allowance(&policy_id);
-    assert_eq!(after, 9_500_000);
+    assert_eq!(res, Err(Ok(PolicyError::RecipientNotAllowed.into())));
+}
+
+/// 15. test_create_policy_zero_amount — max_per_tx = 0 → InvalidAmount.
+#[test]
+fn test_create_policy_zero_amount() {
+    let env = create_test_env();
+    let (client, issuer) = setup(&env);
+    let agent = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+
+    // max_per_tx = 0 should return InvalidAmount
+    let res_max_tx = client.try_create_policy(
+        &agent,
+        &0_i128,
+        &1_000_000_i128,
+        &String::from_str(&env, "USDC"),
+        &issuer,
+        &None,
+    );
+    assert_eq!(res_max_tx, Err(Ok(PolicyError::InvalidAmount.into())));
+
+    // daily_limit = 0 should also return InvalidAmount
+    let res_daily = client.try_create_policy(
+        &agent,
+        &100_000_i128,
+        &0_i128,
+        &String::from_str(&env, "USDC"),
+        &issuer,
+        &None,
+    );
+    assert_eq!(res_daily, Err(Ok(PolicyError::InvalidAmount.into())));
 }
